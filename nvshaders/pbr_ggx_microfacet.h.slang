@@ -95,6 +95,44 @@ float hvd_ggx_eval(const float2 invRoughness,
   return M_1_PI * invRoughness.x * invRoughness.y * h.z / (f * f);
 }
 
+// https://gpuopen.com/download/Bounded_VNDF_Sampling_for_Smith-GGX_Reflections.pdf
+float3 hvd_ggx_sample_vndf_bounded(float3 i, float2 alpha, float2 rand)
+{
+    float3 i_std = normalize(float3(i.x * alpha.x, i.y * alpha.y, i.z));
+
+    // Sample a spherical cap
+    float phi = 2.0f * M_PI * rand.x;
+
+    // Eq.6
+    float a = saturate(min(alpha.x, alpha.y));
+
+    // Omit sgn for a<=1
+    float s = 1.0f + length(i.xy);
+
+    float a2 = a * a;
+    float s2 = s * s;
+
+    // Eq.5
+    float k = (1.0f - a2) * s2 / (s2 + a2 * i.z * i.z);
+
+    float b = i.z > 0.0f ? k * i_std.z : i_std.z;
+
+    float z = mad(1.0f - rand.y, 1.0f + b, -b);
+
+    float sinTheta = sqrt(saturate(1.0f - z * z));
+
+    float3 o_std = float3(sinTheta * cos(phi), sinTheta * sin(phi), z);
+
+    // Compute the microfacet normal m
+    float3 m_std = i_std + o_std;
+    float3 m = normalize(float3(m_std.xy * alpha, m_std.z));
+
+    // the reflection vector o
+    //float3 o = 2.0f * dot(i,m) * m - i;
+
+    return m;
+}
+
 /*-------------------------------------------------------------------------------------------------
 # Function `hvd_ggx_sample_vndf`
 > Samples Samples a visible (Smith-masked) half vector according to the anisotropic GGX distribution.
