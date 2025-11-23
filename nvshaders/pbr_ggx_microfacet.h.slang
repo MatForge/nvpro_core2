@@ -78,6 +78,35 @@ bool isTIR(const float2 ior, const float kh)
   return (1.0f < (b * b * (1.0f - kh * kh)));
 }
 
+// https://gpuopen.com/download/Bounded_VNDF_Sampling_for_Smith-GGX_Reflections.pdf
+float pdf_ggx_reflection_bounded(float3 i, float3 H, float2 alpha)
+{
+    float ndf = D_GGX(H, alpha);
+
+    float2 ai = alpha * i.xy;
+    float len2 = dot(ai, ai);
+    float t = sqrt(len2 + i.z * i.z);
+
+    if (i.z >= 0.0f)
+    {
+        // Eq. 6
+        float a = saturate(min(alpha.x, alpha.y));
+        // Omit sgn for a<=1
+        float s = 1.0f + length(i.xy);
+        float a2 = a * a;
+        float s2 = s * s;
+
+        // Eq.5
+        float k = (1.0f - a2) * s2 / (s2 + a2 * i.z * i.z);
+
+        // Eq.8
+        return ndf / (2.0f * (k * i.z + t));
+    }
+    else
+    {
+        return ndf * (t - i.z) / (2.0f * len2);
+    }
+}
 
 /*-------------------------------------------------------------------------------------------------
 # Function `hvd_ggx_eval`
@@ -95,7 +124,13 @@ float hvd_ggx_eval(const float2 invRoughness,
   return M_1_PI * invRoughness.x * invRoughness.y * h.z / (f * f);
 }
 
-// https://gpuopen.com/download/Bounded_VNDF_Sampling_for_Smith-GGX_Reflections.pdf
+float D_GGX(const float3 h, const float2 roughness) {
+    float2 invRoughness = 1.0f / max(float2(0.001f), roughness);
+
+    if (h.z <= 0.00001f) return 0.0f;
+    return hvd_ggx_eval(invRoughness, h) / h.z;
+}
+
 float3 hvd_ggx_sample_vndf_bounded(float3 i, float2 alpha, float2 rand)
 {
     float3 i_std = normalize(float3(i.x * alpha.x, i.y * alpha.y, i.z));
