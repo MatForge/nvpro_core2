@@ -505,9 +505,20 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   if (useBoundedVNDF)
   {
       data.pdf = pdf_ggx_reflection_bounded(k10, h0, mat.roughness);
-      float D = D_GGX(h0, mat.roughness);
-      float G = (D * G12) / (4.0f * nk1);
-      data.bsdf_over_pdf = float3(G / max(1e-6f, data.pdf));
+      float2 alpha = mat.roughness;
+      float2 ai = alpha * k10.xy;
+      float len2 = dot(ai, ai);
+      float t = sqrt(len2 + k10.z * k10.z);
+
+      float a_val = saturate(min(alpha.x, alpha.y));
+      float s_val = 1.0f + length(k10.xy);
+      float a2 = a_val * a_val;
+      float s2 = s_val * s_val;
+      float k_val = (1.0f - a2) * s2 / (s2 + a2 * k10.z * k10.z);
+
+      float weight_geometry = (G12 * (k_val * k10.z + t)) / (2.0f * k10.z);
+
+      data.bsdf_over_pdf = float3(weight_geometry);
   }
   else
   {
