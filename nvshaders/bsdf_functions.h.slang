@@ -337,7 +337,7 @@ void brdf_diffuse_transmission_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data,
 
 // Evaluates a reflective lobe with a GGX NDF and an uncorrelated Smith
 // scattering-masking function.
-void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint)
+void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, const int lobe, float3 tint, bool useBoundedVNDF)
 {
   const float nk1 = abs(dot(data.k1, mat.N));
   const float nk2 = abs(dot(data.k2, mat.N));
@@ -361,7 +361,23 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   // Compute BSDF and pdf.
   const float3 h0 = float3(dot(mat.T, h), dot(mat.B, h), nh);
 
-  data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0);
+  if (useBoundedVNDF)
+  {
+      float3 k10 = float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1);
+      // New: Bounded PDF
+      data.pdf = pdf_ggx_reflection_bounded(k10, h0, mat.roughness);
+  }
+  else
+  {
+      // Old: Standard VNDF PDF
+      // hvd_ggx_eval returns (D * nh)
+      data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0);
+      // Current PDF is (D * nh), we need (D * G1) / (4 * nk1)
+      // Note: The original code does steps later, but we need to unify flow here.
+      // Let's keep original flow for non-bounded to match exact numerical behavior.
+      // (See below block)
+  }
+
   float G1;
   float G2;
 
@@ -369,11 +385,28 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
   G12 = ggx_smith_shadow_mask(G1, G2, float3(dot(mat.T, data.k1), dot(mat.B, data.k1), nk1),
                               float3(dot(mat.T, data.k2), dot(mat.B, data.k2), nk2), mat.roughness);
 
-  data.pdf *= 0.25f / (nk1 * nh);
+  float3 bsdf;
 
-  float3 bsdf = float3(G12 * data.pdf);
+  if (useBoundedVNDF)
+  {
+      // BSDF = F * D * G12 / (4 * nk1 * nk2)
+      // data.bsdf_glossy = BSDF * nk2 (cosine term) -> F * D * G12 / (4 * nk1)
 
-  data.pdf *= G1;
+      // Calculate Pure D
+      float D = D_GGX(h0, mat.roughness);
+
+      // Note: F (Fresnel) is applied later via 'tint' modulation
+      float val = (D * G12) / (4.0f * nk1);
+      bsdf = float3(val);
+  }
+  else
+  {
+      data.pdf *= 0.25f / (nk1 * nh);
+
+      bsdf = float3(G12 * data.pdf);
+
+      data.pdf *= G1;
+  }
 
   if(mat.iridescence > 0.0f)
   {
@@ -397,7 +430,7 @@ void brdf_ggx_smith_eval(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMateria
 
 // Samples a reflective lobe with a GGX NDF and an uncorrelated Smith
 // scattering-masking function.
-void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, const int lobe, float3 tint)
+void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, const int lobe, float3 tint, bool useBoundedVNDF)
 {
   // When the sampling returns eventType = BSDF_EVENT_ABSORB, the path ends inside the ray generation program.
   // Make sure the returned values are valid numbers when manipulating the PRD.
@@ -414,7 +447,18 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
   const float3 k10 = float3(dot(data.k1, mat.T), dot(data.k1, mat.B), nk1);
 
   // Sample half-vector, microfacet normal.
-  const float3 h0 = hvd_ggx_sample_vndf(k10, mat.roughness, data.xi.xy);
+  float3 h0;
+
+  if (useBoundedVNDF)
+  {
+      h0 = hvd_ggx_sample_vndf_bounded(k10, mat.roughness, data.xi.xy);
+  }
+  else
+  {
+      // Original library function
+      h0 = hvd_ggx_sample_vndf(k10, mat.roughness, data.xi.xy);
+  }
+
   if(h0.z == 0.0f)
   {
     data.event_type = BSDF_EVENT_ABSORB;
@@ -456,12 +500,21 @@ void brdf_ggx_smith_sample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMateria
     return;
   }
 
-  data.bsdf_over_pdf = float3(G2);
   data.event_type    = BSDF_EVENT_GLOSSY_REFLECTION;
 
-  // Compute pdf
-  data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0) * G1;
-  data.pdf *= 0.25f / (nk1 * h0.z);
+  if (useBoundedVNDF)
+  {
+      data.pdf = pdf_ggx_reflection_bounded(k10, h0, mat.roughness);
+      float D = D_GGX(h0, mat.roughness);
+      float G = (D * G12) / (4.0f * nk1);
+      data.bsdf_over_pdf = float3(G / max(1e-6f, data.pdf));
+  }
+  else
+  {
+      data.bsdf_over_pdf = float3(G2);
+      data.pdf = hvd_ggx_eval(1.0f / mat.roughness, h0) * G1;
+      data.pdf *= 0.25f / (nk1 * h0.z);
+  }
 
   if(mat.iridescence > 0.0f)
   {
@@ -902,7 +955,7 @@ The diffuse lobe evaluation and the sum of the specular lobe evaluations
 `data.bsdf_diffuse` and `data.bsdf_glossy`. Additionally, the probability that
 the sampling code will return this direction will be returned in `data.pdf`.
 -------------------------------------------------------------------------------------------------*/
-void bsdfEvaluate(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
+void bsdfEvaluate(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat, bool useBoundedVNDF)
 {
   float3 tint       = mat.baseColor;
   float  VdotN      = dot(data.k1, mat.N);
@@ -921,7 +974,7 @@ void bsdfEvaluate(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
   }
   else if(lobe == LOBE_SPECULAR_REFLECTION)
   {
-    brdf_ggx_smith_eval(data, mat, LOBE_SPECULAR_REFLECTION, mat.specularColor);
+      brdf_ggx_smith_eval(data, mat, LOBE_SPECULAR_REFLECTION, mat.specularColor, useBoundedVNDF);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
@@ -929,14 +982,14 @@ void bsdfEvaluate(NVSHADERS_INOUT_TYPE(BsdfEvaluateData) data, PbrMaterial mat)
   }
   else if(lobe == LOBE_METAL_REFLECTION)
   {
-    brdf_ggx_smith_eval(data, mat, LOBE_METAL_REFLECTION, mat.baseColor);
+      brdf_ggx_smith_eval(data, mat, LOBE_METAL_REFLECTION, mat.baseColor, useBoundedVNDF);
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
     mat.roughness   = float2(mat.clearcoatRoughness * mat.clearcoatRoughness);
     mat.N           = mat.Nc;
     mat.iridescence = 0.0f;
-    brdf_ggx_smith_eval(data, mat, LOBE_CLEARCOAT_REFLECTION, float3(1, 1, 1));
+    brdf_ggx_smith_eval(data, mat, LOBE_CLEARCOAT_REFLECTION, float3(1, 1, 1), useBoundedVNDF);
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
@@ -966,7 +1019,7 @@ There are two things you should check after calling this function:
   as if `data.pdf` was infinity.
   
 -------------------------------------------------------------------------------------------------*/
-void bsdfSample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat)
+void bsdfSample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat, bool useFastMSX, bool useBoundedVNDF)
 {
   float3 tint        = mat.baseColor;
   float  VdotN       = dot(data.k1, mat.N);
@@ -985,7 +1038,7 @@ void bsdfSample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat)
   }
   else if(lobe == LOBE_SPECULAR_REFLECTION)
   {
-    brdf_ggx_smith_sample(data, mat, LOBE_SPECULAR_REFLECTION, mat.specularColor);
+      brdf_ggx_smith_sample(data, mat, LOBE_SPECULAR_REFLECTION, mat.specularColor, useBoundedVNDF);
   }
   else if(lobe == LOBE_SPECULAR_TRANSMISSION)
   {
@@ -993,7 +1046,7 @@ void bsdfSample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat)
   }
   else if(lobe == LOBE_METAL_REFLECTION)
   {
-    brdf_ggx_smith_sample(data, mat, LOBE_METAL_REFLECTION, mat.baseColor);
+      brdf_ggx_smith_sample(data, mat, LOBE_METAL_REFLECTION, mat.baseColor, useBoundedVNDF);
   }
   else if(lobe == LOBE_CLEARCOAT_REFLECTION)
   {
@@ -1002,7 +1055,7 @@ void bsdfSample(NVSHADERS_INOUT_TYPE(BsdfSampleData) data, PbrMaterial mat)
     mat.B           = normalize(cross(mat.N, mat.T));  // Assumes Nc and Tc are not collinear!
     mat.T           = cross(mat.B, mat.N);
     mat.iridescence = 0.0f;
-    brdf_ggx_smith_sample(data, mat, LOBE_CLEARCOAT_REFLECTION, float3(1, 1, 1));
+    brdf_ggx_smith_sample(data, mat, LOBE_CLEARCOAT_REFLECTION, float3(1, 1, 1), useBoundedVNDF);
   }
   else if(lobe == LOBE_SHEEN_REFLECTION)
   {
