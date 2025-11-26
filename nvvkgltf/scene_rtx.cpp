@@ -125,6 +125,13 @@ void nvvkgltf::SceneRtx::destroy()
     m_memoryTracker.untrack(kMemCategoryInstances, m_instancesBuffer.allocation);
     m_alloc->destroyBuffer(m_instancesBuffer);
   }
+
+  // Destroy AABB buffer for displaced primitives
+  if(m_aabbBuffer.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyBuffer(m_aabbBuffer);
+  }
+
   destroyScratchBuffers();
 
   if(m_tlasAccel.accel != VK_NULL_HANDLE && m_tlasAccel.buffer.allocation)
@@ -197,6 +204,51 @@ nvvk::AccelerationStructureGeometryInfo nvvkgltf::SceneRtx::renderPrimitiveToAsG
 }
 
 //--------------------------------------------------------------------------------------------------
+// Convert RenderPrimitive to AABB geometry for displacement mapping
+//
+// This function creates AABB bounding boxes for each triangle in the primitive,
+// expanded by the displacement range from RMIP
+//
+nvvk::AccelerationStructureGeometryInfo nvvkgltf::SceneRtx::renderPrimitiveToAabbGeometry(
+    const nvvkgltf::RenderPrimitive& prim,
+    VkDeviceAddress                  vertexAddress,
+    VkDeviceAddress                  indexAddress,
+    const DisplacementInfo&         dispInfo,
+    VkDeviceAddress                  aabbAddress)
+{
+  nvvk::AccelerationStructureGeometryInfo result;
+  uint32_t numTriangles = prim.indexCount / 3;
+
+  // NOTE: For RMIP displacement mapping, we create AABB geometry instead of triangle geometry.
+  // The AABBs should ideally be computed based on triangle vertices + displacement bounds.
+  // For now, we're using a placeholder AABB buffer.
+  //
+  // TODO: Implement proper AABB computation via one of these methods:
+  // 1. Compute shader to generate AABBs from vertex/index buffers + displacement range
+  // 2. CPU-side AABB computation during scene loading
+  // 3. Conservative whole-mesh AABB (simple but potentially inefficient)
+  //
+  // The custom intersection shader will perform the actual ray-displacement intersection
+  // using the RMIP structure, so the AABBs just need to be conservative bounds.
+
+  VkAccelerationStructureGeometryAabbsDataKHR aabbsData{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR};
+  aabbsData.data.deviceAddress = aabbAddress;
+  aabbsData.stride = sizeof(VkAabbPositionsKHR);
+
+  result.geometry.sType              = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+  result.geometry.geometryType       = VK_GEOMETRY_TYPE_AABBS_KHR;
+  result.geometry.flags              = VK_GEOMETRY_OPAQUE_BIT_KHR;
+  result.geometry.geometry.aabbs     = aabbsData;
+
+  result.rangeInfo.firstVertex     = 0;
+  result.rangeInfo.primitiveCount  = numTriangles;  // One AABB per triangle
+  result.rangeInfo.primitiveOffset = 0;
+  result.rangeInfo.transformOffset = 0;
+
+  return result;
+}
+
+//--------------------------------------------------------------------------------------------------
 // Create the bottom-level acceleration structure
 //
 // This function creates the bottom-level acceleration structure (BLAS)
@@ -233,6 +285,99 @@ void nvvkgltf::SceneRtx::createBottomLevelAccelerationStructure(const nvvkgltf::
     auto geo = renderPrimitiveToAsGeometry(renderPrimitives[p_idx], vertexAddress, indexAddress);
     blasData.addGeometry(geo);
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo = blasData.finalizeGeometry(m_device, flags);  // Will query the size of the resulting BLAS
+  }
+
+  // Create the bottom-level acceleration structure Builder and query pool for compaction
+  m_blasBuilder = std::make_unique<nvvk::AccelerationStructureBuilder>();
+  m_blasBuilder->init(m_alloc);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Create the bottom-level acceleration structure with displacement information
+//
+// This version creates AABB geometry for displaced primitives instead of triangle geometry
+//
+void nvvkgltf::SceneRtx::createBottomLevelAccelerationStructure(const nvvkgltf::Scene& scene,
+                                                                const SceneVk& sceneVk,
+                                                                VkBuildAccelerationStructureFlagsKHR flags,
+                                                                const std::vector<DisplacementInfo>& displacementInfo)
+{
+  nvutils::ScopedTimer st(__FUNCTION__);
+
+  destroy();  // Make sure not to leave allocated buffers
+
+  auto& renderPrimitives = scene.getRenderPrimitives();
+
+  // BLAS - Storing each primitive in a geometry
+  m_blasBuildData.resize(renderPrimitives.size());
+  m_blasAccel.resize(m_blasBuildData.size());
+
+  // Retrieve the array of primitive buffers (see in SceneVk)
+  const auto& vertexBuffers = sceneVk.vertexBuffers();
+  const auto& indices       = sceneVk.indices();
+
+  // Count total AABBs needed for all displaced primitives
+  VkDeviceSize totalAABBs = 0;
+  for(uint32_t p_idx = 0; p_idx < renderPrimitives.size(); p_idx++)
+  {
+    const auto& prim = renderPrimitives[p_idx];
+    if(prim.pPrimitive && prim.pPrimitive->material >= 0 &&
+       prim.pPrimitive->material < static_cast<int>(displacementInfo.size()) &&
+       displacementInfo[prim.pPrimitive->material].hasDisplacement)
+    {
+      uint32_t numTriangles = prim.indexCount / 3;
+      totalAABBs += numTriangles;  // One AABB per triangle
+    }
+  }
+
+  // Create AABB buffer for displaced primitives (VkAabbPositionsKHR per triangle)
+  VkDeviceSize aabbBufferSize = totalAABBs * sizeof(VkAabbPositionsKHR);
+  if(aabbBufferSize > 0)
+  {
+    NVVK_CHECK(m_alloc->createBuffer(m_aabbBuffer, aabbBufferSize,
+                                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                     VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                     VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT));
+  }
+
+  VkDeviceSize aabbOffset = 0;
+  for(uint32_t p_idx = 0; p_idx < renderPrimitives.size(); p_idx++)
+  {
+    auto& blasData  = m_blasBuildData[p_idx];
+    blasData.asType = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+
+    const auto& prim = renderPrimitives[p_idx];
+    VkDeviceAddress vertexAddress = vertexBuffers[p_idx].position.address;
+    VkDeviceAddress indexAddress  = indices[p_idx].address;
+
+    // Check if this primitive has displacement
+    bool hasDisplacement = false;
+    DisplacementInfo dispInfo;
+    if(prim.pPrimitive && prim.pPrimitive->material >= 0 &&
+       prim.pPrimitive->material < static_cast<int>(displacementInfo.size()))
+    {
+      dispInfo = displacementInfo[prim.pPrimitive->material];
+      hasDisplacement = dispInfo.hasDisplacement;
+    }
+
+    nvvk::AccelerationStructureGeometryInfo geo;
+    if(hasDisplacement)
+    {
+      // Create AABB geometry for displaced primitive
+      VkDeviceAddress aabbAddress = m_aabbBuffer.address + aabbOffset;
+      geo = renderPrimitiveToAabbGeometry(prim, vertexAddress, indexAddress, dispInfo, aabbAddress);
+
+      uint32_t numTriangles = prim.indexCount / 3;
+      aabbOffset += numTriangles * sizeof(VkAabbPositionsKHR);
+    }
+    else
+    {
+      // Create triangle geometry for non-displaced primitive
+      geo = renderPrimitiveToAsGeometry(prim, vertexAddress, indexAddress);
+    }
+
+    blasData.addGeometry(geo);
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo = blasData.finalizeGeometry(m_device, flags);
   }
 
   // Create the bottom-level acceleration structure Builder and query pool for compaction

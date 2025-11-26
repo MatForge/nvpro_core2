@@ -34,6 +34,13 @@ It is using the `nvvkgltf::Scene` and `nvvkgltf::SceneVk` information to create 
  -------------------------------------------------------------------------------------------------*/
 namespace nvvkgltf {
 
+// Displacement information for RMIP (per material)
+struct DisplacementInfo {
+  bool hasDisplacement = false;
+  float minDisplacement = 0.0f;
+  float maxDisplacement = 0.0f;
+};
+
 class SceneRtx
 {
 public:
@@ -48,6 +55,8 @@ public:
   void create(VkCommandBuffer cmd, nvvk::StagingUploader& staging, const nvvkgltf::Scene& scn, const SceneVk& scnVk, VkBuildAccelerationStructureFlagsKHR flags);
   // Create the bottom level acceleration structure
   void createBottomLevelAccelerationStructure(const nvvkgltf::Scene& scene, const SceneVk& sceneVk, VkBuildAccelerationStructureFlagsKHR flags);
+  // Create the bottom level acceleration structure with displacement info
+  void createBottomLevelAccelerationStructure(const nvvkgltf::Scene& scene, const SceneVk& sceneVk, VkBuildAccelerationStructureFlagsKHR flags, const std::vector<DisplacementInfo>& displacementInfo);
   // Build the bottom level acceleration structure
   bool cmdBuildBottomLevelAccelerationStructure(VkCommandBuffer cmd, VkDeviceSize hintMaxBudget = 512'000'000);
 
@@ -82,6 +91,13 @@ protected:
                                                                       VkDeviceAddress                  vertexAddress,
                                                                       VkDeviceAddress                  indexAddress);
 
+  // Create AABB geometry for displaced primitives
+  nvvk::AccelerationStructureGeometryInfo renderPrimitiveToAabbGeometry(const nvvkgltf::RenderPrimitive& prim,
+                                                                         VkDeviceAddress                  vertexAddress,
+                                                                         VkDeviceAddress                  indexAddress,
+                                                                         const DisplacementInfo&         dispInfo,
+                                                                         VkDeviceAddress                  aabbAddress);
+
   VkDevice         m_device         = VK_NULL_HANDLE;
   VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
 
@@ -98,6 +114,7 @@ protected:
   nvvk::Buffer m_blasScratchBuffer;
   nvvk::Buffer m_tlasScratchBuffer;
   nvvk::Buffer m_instancesBuffer;
+  nvvk::Buffer m_aabbBuffer;  // Buffer for AABB data (displaced primitives)
 
   uint32_t m_numVisibleElement = 0;
 
