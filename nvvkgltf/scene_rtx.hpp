@@ -83,6 +83,9 @@ public:
   GpuMemoryTracker&       getMemoryTracker() { return m_memoryTracker; }
   void                    trackBlasMemory();  // Track all BLAS allocations (call after all BLAS are built)
 
+  // Get AABB buffer for displacement mapping
+  const nvvk::Buffer& getAabbBuffer() const { return m_aabbBuffer; }
+
 protected:
   VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
   VkPhysicalDeviceAccelerationStructurePropertiesKHR m_rtASProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
