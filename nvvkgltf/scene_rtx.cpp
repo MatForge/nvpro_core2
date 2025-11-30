@@ -541,6 +541,106 @@ void nvvkgltf::SceneRtx::cmdCreateBuildTopLevelAccelerationStructure(VkCommandBu
   nvvk::accelerationStructureBarrier(cmd, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
 }
 
+//--------------------------------------------------------------------------------------------------
+// Create the top-level acceleration structure from all the BLAS with displacement info
+// This version correctly sets the hit group for displaced primitives
+//
+void nvvkgltf::SceneRtx::cmdCreateBuildTopLevelAccelerationStructure(VkCommandBuffer        cmd,
+                                                                     nvvk::StagingUploader& staging,
+                                                                     const nvvkgltf::Scene& scene,
+                                                                     const std::vector<DisplacementInfo>& displacementInfo)
+{
+  nvutils::ScopedTimer st(__FUNCTION__);
+  const auto&          materials   = scene.getModel().materials;
+  const auto&          drawObjects = scene.getRenderNodes();
+  const auto&          renderPrimitives = scene.getRenderPrimitives();
+
+  uint32_t instanceCount = static_cast<uint32_t>(drawObjects.size());
+
+  m_tlasInstances.clear();
+  m_tlasInstances.reserve(instanceCount);
+  for(const auto& object : drawObjects)
+  {
+    const tinygltf::Material&  mat           = materials[object.materialID];
+    VkGeometryInstanceFlagsKHR instanceFlags = getInstanceFlag(mat);
+
+    VkDeviceAddress blasAddress = m_blasAccel[object.renderPrimID].address;
+    if(!object.visible)
+      blasAddress = 0;  // The instance is added, but the BLAS is set to null making it invisible
+
+    // Check if this primitive has displacement
+    uint32_t hitGroupOffset = 0;  // Default: regular geometry (hit group 0)
+    const auto& prim = renderPrimitives[object.renderPrimID];
+    if(prim.pPrimitive && prim.pPrimitive->material >= 0 &&
+       prim.pPrimitive->material < static_cast<int>(displacementInfo.size()) &&
+       displacementInfo[prim.pPrimitive->material].hasDisplacement)
+    {
+      hitGroupOffset = 2;  // Displaced geometry uses hit group 2 (custom intersection)
+    }
+
+    VkAccelerationStructureInstanceKHR asInstance{};
+    asInstance.transform           = nvvk::toTransformMatrixKHR(object.worldMatrix);  // Position of the instance
+    asInstance.instanceCustomIndex = object.renderPrimID;                             // gl_InstanceCustomIndexEXT
+    asInstance.accelerationStructureReference         = blasAddress;                  // The reference to the BLAS
+    asInstance.instanceShaderBindingTableRecordOffset = hitGroupOffset;               // Hit group: 0 for regular, 2 for displaced
+    asInstance.mask                                   = 0x01;                          // Visibility mask
+    asInstance.flags                                  = instanceFlags;
+
+    // Storing the instance
+    m_tlasInstances.push_back(asInstance);
+  }
+
+  VkBuildAccelerationStructureFlagsKHR buildFlags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+  //if(scene.hasAnimation())
+  {
+    buildFlags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+  }
+
+  // Create a buffer holding the actual instance data (matrices++) for use by the AS builder.
+  // Instance buffer device addresses must be aligned to 16 bytes according to
+  // https://vulkan.lunarg.com/doc/view/1.4.328.1/windows/antora/spec/latest/chapters/accelstructures.html#VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03717 .
+  constexpr VmaAllocationCreateFlags instanceAllocFlags   = 0;
+  constexpr VkDeviceSize             instanceMinAlignment = 16;
+  NVVK_CHECK(m_alloc->createBuffer(m_instancesBuffer, std::span(m_tlasInstances).size_bytes(),
+                                   VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                                   VMA_MEMORY_USAGE_AUTO, instanceAllocFlags, instanceMinAlignment));
+  NVVK_CHECK(staging.appendBuffer(m_instancesBuffer, 0, std::span(m_tlasInstances)));
+  NVVK_DBG_NAME(m_instancesBuffer.buffer);
+  m_memoryTracker.track(kMemCategoryInstances, m_instancesBuffer.allocation);
+
+  m_tlasBuildData.asType = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+  auto geo               = m_tlasBuildData.makeInstanceGeometry(m_tlasInstances.size(), m_instancesBuffer.address);
+  m_tlasBuildData.addGeometry(geo);
+
+  staging.cmdUploadAppended(cmd);
+
+  // Make sure the copy of the instance buffer are copied before triggering the acceleration structure build
+  nvvk::accelerationStructureBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT);
+
+  // Calculate the amount of scratch memory needed to build the TLAS
+  VkAccelerationStructureBuildSizesInfoKHR sizeInfo = m_tlasBuildData.finalizeGeometry(m_device, buildFlags);
+
+  // Create the scratch buffer needed during build of the TLAS
+  NVVK_CHECK(m_alloc->createBuffer(m_tlasScratchBuffer, sizeInfo.buildScratchSize,
+                                   VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT
+                                       | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR));
+  NVVK_DBG_NAME(m_tlasScratchBuffer.buffer);
+  m_memoryTracker.track(kMemCategoryScratch, m_tlasScratchBuffer.allocation);
+
+  VkAccelerationStructureCreateInfoKHR createInfo = m_tlasBuildData.makeCreateInfo();
+  NVVK_CHECK(m_alloc->createAcceleration(m_tlasAccel, createInfo));
+  NVVK_DBG_NAME(m_tlasAccel.accel);
+  m_memoryTracker.track(kMemCategoryTLAS, m_tlasAccel.buffer.allocation);
+
+
+  // Build the TLAS
+  m_tlasBuildData.cmdBuildAccelerationStructure(cmd, m_tlasAccel.accel, m_tlasScratchBuffer.address);
+
+  // Make sure to have the TLAS ready before using it
+  nvvk::accelerationStructureBarrier(cmd, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+}
+
 
 // This function is called when the scene has been updated
 void nvvkgltf::SceneRtx::updateTopLevelAS(VkCommandBuffer cmd, nvvk::StagingUploader& staging, const nvvkgltf::Scene& scene)

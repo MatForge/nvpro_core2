@@ -62,6 +62,8 @@ public:
 
   // Create the top level acceleration structure
   void cmdCreateBuildTopLevelAccelerationStructure(VkCommandBuffer cmd, nvvk::StagingUploader& staging, const nvvkgltf::Scene& scene);
+  // Create the top level acceleration structure with displacement info
+  void cmdCreateBuildTopLevelAccelerationStructure(VkCommandBuffer cmd, nvvk::StagingUploader& staging, const nvvkgltf::Scene& scene, const std::vector<DisplacementInfo>& displacementInfo);
   // Compact the bottom level acceleration structure
   VkResult cmdCompactBlas(VkCommandBuffer cmd);
   // Destroy the original acceleration structures that was compacted
