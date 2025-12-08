@@ -715,6 +715,30 @@ void nvvkgltf::SceneRtx::updateBottomLevelAS(VkCommandBuffer cmd, const nvvkgltf
   }
 }
 
+void nvvkgltf::SceneRtx::updateBlasForPrimitives(VkCommandBuffer cmd, const std::vector<uint32_t>& primitiveIDs)
+{
+  // For AABB geometry with changing bounds, we need a full rebuild (not update)
+  // Check if scratch buffer is available
+  if(m_blasScratchBuffer.buffer == VK_NULL_HANDLE || m_blasScratchBuffer.address == 0)
+  {
+    LOGW("Warning: BLAS scratch buffer not available for rebuild\n");
+    return;
+  }
+
+  for(auto primID : primitiveIDs)
+  {
+    if(primID < m_blasBuildData.size() && primID < m_blasAccel.size())
+    {
+      // Use full rebuild (BUILD mode) instead of update for AABB geometry
+      // This is required when AABB data changes (displacement factor changes)
+      m_blasBuildData[primID].cmdBuildAccelerationStructure(cmd, m_blasAccel[primID].accel, m_blasScratchBuffer.address);
+      // Add synchronization between consecutive acceleration structure builds that use the same scratch buffer
+      nvvk::accelerationStructureBarrier(cmd, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                                         VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+    }
+  }
+}
+
 VkResult nvvkgltf::SceneRtx::cmdCompactBlas(VkCommandBuffer cmd)
 {
   nvutils::ScopedTimer st(__FUNCTION__ + std::string("\n"));

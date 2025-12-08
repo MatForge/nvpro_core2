@@ -72,6 +72,8 @@ public:
   void updateTopLevelAS(VkCommandBuffer cmd, nvvk::StagingUploader& staging, const nvvkgltf::Scene& scene);
   // Update the bottom level acceleration structure
   void updateBottomLevelAS(VkCommandBuffer cmd, const nvvkgltf::Scene& scene);
+  // Update BLAS for specific primitive IDs (for displaced geometry)
+  void updateBlasForPrimitives(VkCommandBuffer cmd, const std::vector<uint32_t>& primitiveIDs);
 
   // Return the constructed acceleration structure
   VkAccelerationStructureKHR tlas();
